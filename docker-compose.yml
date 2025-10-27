@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  yagami-bot:
+    build: .
+    container_name: yagami-bot-manager
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./bots_config.json:/app/bots_config.json
+      - ./deployed_bots:/app/deployed_bots
+      - ./logs:/app/logs
+    environment:
+      - BOT_TOKEN=${BOT_TOKEN}
+    networks:
+      - yagami-network
+
+networks:
+  yagami-network:
+    driver: bridge
