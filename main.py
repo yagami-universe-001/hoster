@@ -11,6 +11,7 @@ import subprocess
 import shutil
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import BadRequest
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 
 # Configuration
@@ -337,7 +338,11 @@ async def show_bots(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     if query:
-        await message.edit_text(text, parse_mode='HTML', reply_markup=reply_markup)
+        try:
+            await message.edit_text(text, parse_mode='HTML', reply_markup=reply_markup)
+        except BadRequest as e:
+            if "Message is not modified" not in str(e):
+                raise e
     else:
         await message.reply_text(text, parse_mode='HTML', reply_markup=reply_markup)
 
