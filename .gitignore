@@ -28,4 +28,31 @@ wheels/
 .installed.cfg
 *.egg
 
-# Virtual
+# Virtual Environment
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Logs
+logs/
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Deployed bots directory (optional - uncomment if you don't want to track deployed bots)
+# deployed_bots/
+
+# Temporary files
+*.tmp
+temp/
