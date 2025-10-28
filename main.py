@@ -452,7 +452,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     elif data == "vpsinfo":
         await query.answer("Refreshing...")
-        await vps_info(update, context)
+        await vps_info_command(update, context)
     
     elif data.startswith("sel_"):
         await query.answer()
@@ -562,7 +562,7 @@ def main():
     
     # Add handlers
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("vps", vps_info))
+    app.add_handler(CommandHandler("vps", vps_info_command))
     app.add_handler(CommandHandler("deploy", deploy_command))
     app.add_handler(CommandHandler("bots", show_bots))
     app.add_handler(CommandHandler("cmd", execute_cmd))
