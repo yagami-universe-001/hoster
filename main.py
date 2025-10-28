@@ -1,921 +1,905 @@
+"""
+Yagami Bot Manager - GitHub Repository Deployment System
+Deploy Telegram bots from GitHub repositories directly through Telegram
+Admin-only bot for VPS deployment management
+"""
+
 import os
 import json
+import asyncio
 import subprocess
-import docker
-import psutil
 import shutil
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, ConversationHandler, MessageHandler, filters
 from datetime import datetime
-import re
-import threading
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 
 # Configuration
 CONFIG_FILE = 'bots_config.json'
-BOTS_DIR = 'hosted_bots'
-LOGS_DIR = 'logs'
-MAX_BOTS_PER_USER = 5
+BOTS_DIR = 'deployed_bots'
+ADMIN_IDS = [int(id.strip()) for id in os.getenv('ADMIN_IDS', '').split(',') if id.strip()]
 
-# Conversation states
-WAITING_BOT_TOKEN, WAITING_BOT_NAME, WAITING_GITHUB_REPO = range(3)
-
-class DockerBotHosting:
+class BotManager:
     def __init__(self):
-        self.bots = self.load_config()
+        self.bots = {}
+        self.load_config()
         os.makedirs(BOTS_DIR, exist_ok=True)
-        os.makedirs(LOGS_DIR, exist_ok=True)
         
-        # Initialize Docker client
-        try:
-            self.docker_client = docker.from_env()
-            print("✅ Docker connected successfully")
-        except Exception as e:
-            print(f"❌ Docker connection failed: {e}")
-            self.docker_client = None
-    
     def load_config(self):
+        """Load bot configurations from file"""
         if os.path.exists(CONFIG_FILE):
             with open(CONFIG_FILE, 'r') as f:
-                return json.load(f)
-        return {}
-    
-    def save_config(self):
-        with open(CONFIG_FILE, 'w') as f:
-            json.dump(self.bots, f, indent=2)
-    
-    def clone_repo(self, repo_url, bot_dir):
-        """Clone GitHub repository"""
-        try:
-            if os.path.exists(bot_dir):
-                shutil.rmtree(bot_dir)
+                self.bots = json.load(f)
+        else:
+            self.bots = {}
             
+    def save_config(self):
+        """Save bot configurations to file"""
+        with open(CONFIG_FILE, 'w') as f:
+            json.dump(self.bots, f, indent=4)
+    
+    def clone_repository(self, repo_url, bot_name):
+        """Clone GitHub repository"""
+        bot_path = os.path.join(BOTS_DIR, bot_name)
+        
+        # Remove existing directory if exists
+        if os.path.exists(bot_path):
+            shutil.rmtree(bot_path)
+        
+        try:
+            # Clone the repository
             result = subprocess.run(
-                ['git', 'clone', repo_url, bot_dir],
+                ['git', 'clone', repo_url, bot_path],
                 capture_output=True,
                 text=True,
                 timeout=120
             )
             
-            return result.returncode == 0, result.stderr if result.returncode != 0 else "Cloned"
+            if result.returncode == 0:
+                return True, "Repository cloned successfully"
+            else:
+                return False, f"Clone failed: {result.stderr}"
+        except subprocess.TimeoutExpired:
+            return False, "Clone timeout (120s)"
         except Exception as e:
-            return False, str(e)
+            return False, f"Error: {str(e)}"
     
-    def detect_project_type(self, bot_dir):
-        """Detect project language/framework"""
-        if os.path.exists(os.path.join(bot_dir, 'package.json')):
-            return 'nodejs'
-        elif os.path.exists(os.path.join(bot_dir, 'requirements.txt')) or \
-             os.path.exists(os.path.join(bot_dir, 'Pipfile')):
-            return 'python'
-        elif os.path.exists(os.path.join(bot_dir, 'go.mod')):
-            return 'golang'
-        elif os.path.exists(os.path.join(bot_dir, 'Gemfile')):
-            return 'ruby'
-        elif os.path.exists(os.path.join(bot_dir, 'composer.json')):
-            return 'php'
-        elif os.path.exists(os.path.join(bot_dir, 'Dockerfile')):
-            return 'docker'
-        else:
-            return 'python'  # Default
-    
-    def create_dockerfile(self, bot_dir, project_type, token):
-        """Create appropriate Dockerfile"""
-        dockerfile_content = ""
+    def install_requirements(self, bot_name):
+        """Install bot requirements"""
+        bot_path = os.path.join(BOTS_DIR, bot_name)
+        requirements_file = os.path.join(bot_path, 'requirements.txt')
         
-        if project_type == 'nodejs':
-            dockerfile_content = f"""FROM node:18-alpine
-WORKDIR /app
-COPY package*.json ./
-RUN npm install
-COPY . .
-ENV BOT_TOKEN={token}
-CMD ["node", "index.js"]"""
+        if not os.path.exists(requirements_file):
+            return True, "No requirements.txt found, skipping..."
         
-        elif project_type == 'python':
-            dockerfile_content = f"""FROM python:3.11-slim
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-COPY . .
-ENV BOT_TOKEN={token}
-CMD ["python", "bot.py"]"""
-        
-        elif project_type == 'golang':
-            dockerfile_content = f"""FROM golang:1.21-alpine
-WORKDIR /app
-COPY go.mod go.sum ./
-RUN go mod download
-COPY . .
-ENV BOT_TOKEN={token}
-RUN go build -o main .
-CMD ["./main"]"""
-        
-        elif project_type == 'ruby':
-            dockerfile_content = f"""FROM ruby:3.2-alpine
-WORKDIR /app
-COPY Gemfile* ./
-RUN bundle install
-COPY . .
-ENV BOT_TOKEN={token}
-CMD ["ruby", "bot.rb"]"""
-        
-        elif project_type == 'php':
-            dockerfile_content = f"""FROM php:8.2-cli
-WORKDIR /app
-COPY composer.json composer.lock ./
-RUN composer install
-COPY . .
-ENV BOT_TOKEN={token}
-CMD ["php", "bot.php"]"""
-        
-        # Write Dockerfile if not exists
-        dockerfile_path = os.path.join(bot_dir, 'Dockerfile')
-        if not os.path.exists(dockerfile_path):
-            with open(dockerfile_path, 'w') as f:
-                f.write(dockerfile_content)
-        
-        return dockerfile_path
-    
-    def build_docker_image(self, bot_dir, image_name):
-        """Build Docker image"""
         try:
-            if not self.docker_client:
-                return False, "Docker not available"
-            
-            image, logs = self.docker_client.images.build(
-                path=bot_dir,
-                tag=image_name,
-                rm=True,
-                pull=True
+            result = subprocess.run(
+                ['pip3', 'install', '-r', requirements_file],
+                capture_output=True,
+                text=True,
+                timeout=300
             )
-            return True, "Image built successfully"
+            
+            if result.returncode == 0:
+                return True, "Requirements installed successfully"
+            else:
+                return False, f"Installation failed: {result.stderr}"
+        except subprocess.TimeoutExpired:
+            return False, "Installation timeout (300s)"
         except Exception as e:
-            return False, str(e)
+            return False, f"Error: {str(e)}"
     
-    def add_bot(self, user_id, bot_name, token, repo_url):
-        """Deploy bot from GitHub using Docker"""
-        user_id = str(user_id)
-        if user_id not in self.bots:
-            self.bots[user_id] = {}
-        
-        # Check bot limit
-        if len(self.bots[user_id]) >= MAX_BOTS_PER_USER:
-            return False, f"Bot limit reached ({MAX_BOTS_PER_USER} bots max)"
-        
-        bot_dir = os.path.join(BOTS_DIR, f"{user_id}_{bot_name}")
-        container_name = f"bot_{user_id}_{bot_name}"
-        image_name = f"bot_image_{user_id}_{bot_name}".lower()
-        
-        # Clone repository
-        success, msg = self.clone_repo(repo_url, bot_dir)
-        if not success:
-            return False, f"Clone failed: {msg}"
-        
-        # Detect project type
-        project_type = self.detect_project_type(bot_dir)
-        
-        # Create Dockerfile
-        self.create_dockerfile(bot_dir, project_type, token)
-        
-        # Build Docker image
-        success, msg = self.build_docker_image(bot_dir, image_name)
-        if not success:
-            shutil.rmtree(bot_dir, ignore_errors=True)
-            return False, f"Build failed: {msg}"
-        
-        # Save bot info
-        self.bots[user_id][bot_name] = {
-            'token': token,
+    def add_bot(self, bot_name, repo_url, bot_token, main_file='main.py'):
+        """Add a new bot from GitHub"""
+        self.bots[bot_name] = {
             'repo_url': repo_url,
-            'bot_dir': bot_dir,
-            'container_name': container_name,
-            'image_name': image_name,
-            'project_type': project_type,
+            'token': bot_token,
+            'main_file': main_file,
             'status': 'stopped',
-            'added_at': datetime.now().isoformat()
+            'pid': None,
+            'added_at': datetime.now().isoformat(),
+            'last_deployed': None
         }
         self.save_config()
         
-        return True, f"Bot deployed! Type: {project_type.upper()}"
+    def remove_bot(self, bot_name):
+        """Remove a bot"""
+        if bot_name in self.bots:
+            self.stop_bot(bot_name)
+            
+            # Remove bot directory
+            bot_path = os.path.join(BOTS_DIR, bot_name)
+            if os.path.exists(bot_path):
+                shutil.rmtree(bot_path)
+            
+            del self.bots[bot_name]
+            self.save_config()
+            return True
+        return False
     
-    def start_bot(self, user_id, bot_name):
-        """Start bot container"""
-        user_id = str(user_id)
-        if user_id not in self.bots or bot_name not in self.bots[user_id]:
+    def start_bot(self, bot_name):
+        """Start a bot process"""
+        if bot_name not in self.bots:
             return False, "Bot not found"
         
-        bot_info = self.bots[user_id][bot_name]
+        bot_path = os.path.join(BOTS_DIR, bot_name)
+        main_file = self.bots[bot_name].get('main_file', 'main.py')
+        bot_file = os.path.join(bot_path, main_file)
+        
+        if not os.path.exists(bot_file):
+            return False, f"Main file not found: {main_file}"
+        
+        # Check if already running
+        if self.bots[bot_name]['status'] == 'running':
+            return False, "Bot already running"
         
         try:
-            if not self.docker_client:
-                return False, "Docker not available"
-            
-            # Stop if already running
-            try:
-                container = self.docker_client.containers.get(bot_info['container_name'])
-                container.stop()
-                container.remove()
-            except:
-                pass
-            
-            # Start new container
-            log_file = os.path.join(LOGS_DIR, f"{user_id}_{bot_name}.log")
-            
-            container = self.docker_client.containers.run(
-                bot_info['image_name'],
-                name=bot_info['container_name'],
-                detach=True,
-                restart_policy={"Name": "unless-stopped"},
-                environment={"BOT_TOKEN": bot_info['token']},
-                network_mode="bridge",
-                mem_limit="512m",
-                cpu_quota=50000
+            # Start bot process
+            process = subprocess.Popen(
+                ['python3', bot_file],
+                cwd=bot_path,
+                env={**os.environ, 'BOT_TOKEN': self.bots[bot_name]['token']},
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
             )
             
-            self.bots[user_id][bot_name]['status'] = 'running'
-            self.bots[user_id][bot_name]['container_id'] = container.id
+            self.bots[bot_name]['status'] = 'running'
+            self.bots[bot_name]['pid'] = process.pid
             self.save_config()
-            
-            return True, "Bot started successfully"
+            return True, f"Bot started (PID: {process.pid})"
         except Exception as e:
-            return False, str(e)
+            return False, f"Failed to start: {str(e)}"
     
-    def stop_bot(self, user_id, bot_name):
-        """Stop bot container"""
-        user_id = str(user_id)
-        if user_id not in self.bots or bot_name not in self.bots[user_id]:
+    def stop_bot(self, bot_name):
+        """Stop a bot process"""
+        if bot_name not in self.bots:
             return False, "Bot not found"
         
-        bot_info = self.bots[user_id][bot_name]
+        pid = self.bots[bot_name].get('pid')
+        if pid:
+            try:
+                os.kill(pid, 9)
+            except ProcessLookupError:
+                pass  # Process already dead
+            except Exception as e:
+                return False, f"Error stopping bot: {str(e)}"
         
-        try:
-            if not self.docker_client:
-                return False, "Docker not available"
-            
-            container = self.docker_client.containers.get(bot_info['container_name'])
-            container.stop(timeout=10)
-            container.remove()
-            
-            self.bots[user_id][bot_name]['status'] = 'stopped'
-            self.save_config()
-            
-            return True, "Bot stopped"
-        except Exception as e:
-            self.bots[user_id][bot_name]['status'] = 'stopped'
-            self.save_config()
-            return True, "Bot stopped"
-    
-    def remove_bot(self, user_id, bot_name):
-        """Remove bot completely"""
-        user_id = str(user_id)
-        if user_id not in self.bots or bot_name not in self.bots[user_id]:
-            return False, "Bot not found"
-        
-        bot_info = self.bots[user_id][bot_name]
-        
-        # Stop container
-        self.stop_bot(user_id, bot_name)
-        
-        # Remove Docker image
-        try:
-            if self.docker_client:
-                self.docker_client.images.remove(bot_info['image_name'], force=True)
-        except:
-            pass
-        
-        # Remove files
-        if os.path.exists(bot_info['bot_dir']):
-            shutil.rmtree(bot_info['bot_dir'], ignore_errors=True)
-        
-        # Remove from config
-        del self.bots[user_id][bot_name]
+        self.bots[bot_name]['status'] = 'stopped'
+        self.bots[bot_name]['pid'] = None
         self.save_config()
-        
-        return True, "Bot removed"
+        return True, "Bot stopped"
     
-    def update_bot(self, user_id, bot_name):
-        """Update bot from GitHub"""
-        user_id = str(user_id)
-        if user_id not in self.bots or bot_name not in self.bots[user_id]:
+    def restart_bot(self, bot_name):
+        """Restart a bot"""
+        success, msg = self.stop_bot(bot_name)
+        if success:
+            return self.start_bot(bot_name)
+        return False, msg
+    
+    def update_bot(self, bot_name):
+        """Update bot from GitHub (pull latest changes)"""
+        if bot_name not in self.bots:
             return False, "Bot not found"
         
-        bot_info = self.bots[user_id][bot_name]
-        was_running = bot_info['status'] == 'running'
+        bot_path = os.path.join(BOTS_DIR, bot_name)
         
-        # Stop bot
-        if was_running:
-            self.stop_bot(user_id, bot_name)
+        if not os.path.exists(bot_path):
+            return False, "Bot directory not found"
         
-        # Pull latest changes
         try:
+            # Pull latest changes
             result = subprocess.run(
                 ['git', 'pull'],
-                cwd=bot_info['bot_dir'],
+                cwd=bot_path,
                 capture_output=True,
                 text=True,
                 timeout=60
             )
             
-            if result.returncode != 0:
-                return False, "Git pull failed"
-            
-            # Rebuild image
-            success, msg = self.build_docker_image(
-                bot_info['bot_dir'],
-                bot_info['image_name']
-            )
-            
-            if not success:
-                return False, f"Rebuild failed: {msg}"
-            
-            # Start if was running
-            if was_running:
-                self.start_bot(user_id, bot_name)
-            
-            return True, "Bot updated successfully"
+            if result.returncode == 0:
+                # Reinstall requirements
+                self.install_requirements(bot_name)
+                return True, "Bot updated successfully"
+            else:
+                return False, f"Update failed: {result.stderr}"
         except Exception as e:
-            return False, str(e)
+            return False, f"Error: {str(e)}"
     
-    def get_logs(self, user_id, bot_name, lines=50):
-        """Get bot logs"""
-        user_id = str(user_id)
-        if user_id not in self.bots or bot_name not in self.bots[user_id]:
-            return None
-        
-        bot_info = self.bots[user_id][bot_name]
-        
-        try:
-            if not self.docker_client:
-                return "Docker not available"
-            
-            container = self.docker_client.containers.get(bot_info['container_name'])
-            logs = container.logs(tail=lines).decode('utf-8')
-            return logs if logs else "No logs yet"
-        except:
-            return "Bot not running"
-    
-    def get_user_bots(self, user_id):
-        user_id = str(user_id)
-        return self.bots.get(user_id, {})
-    
-    def get_status(self, user_id):
-        user_bots = self.get_user_bots(user_id)
-        total = len(user_bots)
-        running = sum(1 for b in user_bots.values() if b['status'] == 'running')
+    def get_stats(self):
+        """Get deployment statistics"""
+        total = len(self.bots)
+        running = sum(1 for b in self.bots.values() if b['status'] == 'running')
         stopped = total - running
-        return {'total': total, 'running': running, 'stopped': stopped}
-    
-    def get_system_stats(self):
-        """Get VPS system statistics"""
-        cpu = psutil.cpu_percent(interval=1)
-        memory = psutil.virtual_memory()
-        disk = psutil.disk_usage('/')
         
         return {
-            'cpu': cpu,
-            'memory_percent': memory.percent,
-            'memory_used': memory.used / (1024**3),
-            'memory_total': memory.total / (1024**3),
-            'disk_percent': disk.percent,
-            'disk_used': disk.used / (1024**3),
-            'disk_total': disk.total / (1024**3)
+            'total': total,
+            'running': running,
+            'stopped': stopped,
+            'error': 0
         }
+    
+    def get_bot_logs(self, bot_name, lines=20):
+        """Get bot logs"""
+        bot_path = os.path.join(BOTS_DIR, bot_name)
+        log_file = os.path.join(bot_path, 'bot.log')
+        
+        if not os.path.exists(log_file):
+            return "No logs found"
+        
+        try:
+            with open(log_file, 'r') as f:
+                all_lines = f.readlines()
+                return ''.join(all_lines[-lines:])
+        except Exception as e:
+            return f"Error reading logs: {str(e)}"
 
-hosting = DockerBotHosting()
+# Initialize bot manager
+bot_manager = BotManager()
+
+def is_admin(user_id):
+    """Check if user is admin"""
+    if not ADMIN_IDS:
+        return True  # If no admin IDs set, allow all
+    return user_id in ADMIN_IDS
+
+async def admin_only(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Decorator to restrict commands to admins"""
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("⛔ Access denied. Admin only.")
+        return False
+    return True
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start command"""
-    user_name = update.effective_user.first_name
+    """Handle /start command"""
+    if not await admin_only(update, context):
+        return
     
-    stats = hosting.get_system_stats()
-    
-    welcome_text = f"""
-🤖 <b>Welcome to Yato VPS Bot Hosting!</b>
+    await update.message.reply_text(
+        "🤖 <b>Yagami Bot Manager</b>\n\n"
+        "Deploy and manage Telegram bots from GitHub repositories\n\n"
+        "<b>Commands:</b>\n"
+        "/deploy - Deploy a new bot from GitHub\n"
+        "/bots - View all deployed bots\n"
+        "/help - Show help message\n\n"
+        "Admin only access ✅",
+        parse_mode='HTML'
+    )
 
-Hi {user_name}! 👋
-
-Deploy and host ANY Telegram bot on our VPS! 🚀
-
-<b>✨ Supported Languages:</b>
-🐍 Python | 📦 Node.js | 🐹 Go
-💎 Ruby | 🐘 PHP | 🐳 Docker
-
-<b>🎯 Features:</b>
-✅ Deploy from GitHub (any language!)
-✅ Auto-detect project type
-✅ Docker containerization
-✅ 24/7 uptime monitoring
-✅ Easy start/stop/update
-✅ Real-time logs
-✅ Resource limits per bot
-
-<b>📊 VPS Status:</b>
-CPU: {stats['cpu']:.1f}% | RAM: {stats['memory_percent']:.1f}%
-Disk: {stats['disk_used']:.1f}GB / {stats['disk_total']:.1f}GB
-
-<b>Commands:</b>
-/start - This message
-/deploy - Deploy bot from GitHub
-/bots - Manage your bots
-/stats - VPS statistics
-/help - Help & examples
-
-Ready? Use /deploy to get started!
-    """
-    
-    keyboard = [
-        [InlineKeyboardButton("📋 My Bots", callback_data="my_bots")],
-        [InlineKeyboardButton("🚀 Deploy New Bot", callback_data="deploy_new")],
-        [InlineKeyboardButton("📊 VPS Stats", callback_data="vps_stats")],
-        [InlineKeyboardButton("❓ Help", callback_data="help")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await update.message.reply_text(welcome_text, parse_mode='HTML', reply_markup=reply_markup)
-
-async def show_bots_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show deployed bots"""
-    user_id = update.effective_user.id
+async def show_bots(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show deployed bots with management interface"""
     query = update.callback_query
-    
-    status = hosting.get_status(user_id)
-    user_bots = hosting.get_user_bots(user_id)
-    
-    message_text = f"🤖 <b>Yato</b>\n📁 <b>/bots</b>\n\n"
-    message_text += "🔍 <b>DEPLOYED BOTS INFO</b>\n\n"
-    message_text += f"🤖 <b>{status['total']}</b> | 🟢 <b>{status['running']}</b> | 🔴 <b>{status['stopped']}</b> | 🟠 <b>0</b> |\n\n"
-    
-    if not user_bots:
-        message_text += "📭 No bots deployed yet.\n\n"
-        message_text += "Use /deploy to add your first bot!"
+    if query:
+        await query.answer()
+        message = query.message
+        user_id = query.from_user.id
     else:
-        for idx, (bot_name, info) in enumerate(user_bots.items(), 1):
+        message = update.message
+        user_id = update.effective_user.id
+    
+    if not is_admin(user_id):
+        if query:
+            await query.answer("⛔ Access denied", show_alert=True)
+        else:
+            await message.reply_text("⛔ Access denied. Admin only.")
+        return
+    
+    stats = bot_manager.get_stats()
+    
+    # Build bot list text
+    text = "🔍 <b>DEPLOYED BOTS INFO</b>\n\n"
+    text += f"🤖 {stats['total']} | 🟢 {stats['running']} | 🔴 {stats['stopped']} | 🟠 {stats['error']} |\n\n"
+    
+    if not bot_manager.bots:
+        text += "No bots deployed yet.\n"
+        text += "Use /deploy to deploy your first bot from GitHub!"
+    else:
+        for idx, (bot_name, info) in enumerate(bot_manager.bots.items(), 1):
             status_emoji = "🟢" if info['status'] == 'running' else "🔴"
-            status_text = "RUNNING" if info['status'] == 'running' else "STOPPED"
-            lang_emoji = {"python": "🐍", "nodejs": "📦", "golang": "🐹", "ruby": "💎", "php": "🐘"}.get(info.get('project_type', 'python'), "🐳")
-            message_text += f"{lang_emoji} <b>{idx}. @{bot_name}</b>\n"
-            message_text += f"{status_emoji} <b>{status_text}</b>\n\n"
+            status_text = info['status'].upper()
+            text += f"🤖 {idx}. <b>{bot_name}</b>\n"
+            text += f"{status_emoji} <b>{status_text}</b>\n"
+            text += f"📦 Repo: <code>{info['repo_url']}</code>\n\n"
     
-    message_text += "\n<b>CLICK BELOW BUTTONS TO CHANGE SETTINGS</b>"
+    text += "\n<b>CLICK BELOW BUTTONS TO CHANGE SETTINGS</b>"
     
+    # Build keyboard
     keyboard = []
     
-    # Bot buttons (3 per row)
+    # Bot selection buttons (3 per row)
     bot_buttons = []
-    for idx in range(1, len(user_bots) + 1):
-        bot_buttons.append(InlineKeyboardButton(f"🟢🤖 {idx}", callback_data=f"bot_{idx}"))
-        if idx % 3 == 0:
-            keyboard.append(bot_buttons)
-            bot_buttons = []
-    if bot_buttons:
-        keyboard.append(bot_buttons)
+    for idx, bot_name in enumerate(bot_manager.bots.keys(), 1):
+        status = bot_manager.bots[bot_name]['status']
+        emoji = "🟢" if status == 'running' else "🔴"
+        bot_buttons.append(InlineKeyboardButton(
+            f"{emoji}🤖 {idx}",
+            callback_data=f"select_{bot_name}"
+        ))
+    
+    # Add bot buttons in rows of 3
+    for i in range(0, len(bot_buttons), 3):
+        keyboard.append(bot_buttons[i:i+3])
     
     # Control buttons
-    if user_bots:
-        keyboard.extend([
-            [
-                InlineKeyboardButton("❌ STOP ALL", callback_data="stop_all"),
-                InlineKeyboardButton("🗑️ REMOVE ALL", callback_data="remove_all")
-            ]
-        ])
+    keyboard.append([
+        InlineKeyboardButton("❌ STOP ALL", callback_data="stop_all"),
+        InlineKeyboardButton("🗑️ REMOVE ALL", callback_data="remove_all")
+    ])
     
-    keyboard.extend([
-        [InlineKeyboardButton("➕ ADD NEW BOTS", callback_data="add_new")],
-        [
-            InlineKeyboardButton("🔄 REFRESH", callback_data="refresh"),
-            InlineKeyboardButton("CLOSE ❌", callback_data="close")
-        ]
+    keyboard.append([
+        InlineKeyboardButton("➕ ADD NEW BOTS", callback_data="add_new")
+    ])
+    
+    keyboard.append([
+        InlineKeyboardButton("🔄 REFRESH", callback_data="refresh"),
+        InlineKeyboardButton("❌ CLOSE", callback_data="close")
     ])
     
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     if query:
-        await query.edit_message_text(message_text, parse_mode='HTML', reply_markup=reply_markup)
+        await message.edit_text(text, parse_mode='HTML', reply_markup=reply_markup)
     else:
-        await update.message.reply_text(message_text, parse_mode='HTML', reply_markup=reply_markup)
+        await message.reply_text(text, parse_mode='HTML', reply_markup=reply_markup)
 
-async def show_vps_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show VPS statistics"""
-    query = update.callback_query
-    stats = hosting.get_system_stats()
+async def show_bot_settings(query, bot_name):
+    """Show individual bot settings"""
+    if bot_name not in vps_manager.bots:
+        await query.answer("Bot not found!", show_alert=True)
+        return
     
-    stats_text = f"""
-📊 <b>VPS Statistics</b>
-
-<b>CPU Usage:</b> {stats['cpu']:.1f}%
-<b>Memory:</b> {stats['memory_used']:.2f}GB / {stats['memory_total']:.2f}GB ({stats['memory_percent']:.1f}%)
-<b>Disk:</b> {stats['disk_used']:.1f}GB / {stats['disk_total']:.1f}GB ({stats['disk_percent']:.1f}%)
-
-<b>Docker Status:</b> {'✅ Running' if hosting.docker_client else '❌ Not Available'}
-
-<b>System Info:</b>
-🐧 Linux VPS
-🐳 Docker Enabled
-🔒 Container Isolated
-    """
+    info = vps_manager.bots[bot_name]
     
-    keyboard = [[InlineKeyboardButton("⬅️ Back", callback_data="my_bots")]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await query.edit_message_text(stats_text, parse_mode='HTML', reply_markup=reply_markup)
-
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle button clicks"""
-    query = update.callback_query
-    await query.answer()
-    
-    data = query.data
-    user_id = update.effective_user.id
-    
-    if data == "my_bots" or data == "refresh":
-        await show_bots_menu(update, context)
-    
-    elif data == "close":
-        await query.message.delete()
-    
-    elif data == "vps_stats":
-        await show_vps_stats(update, context)
-    
-    elif data == "help":
-        help_text = """
-❓ <b>Help - Deploy Bots from GitHub</b>
-
-<b>📝 Step-by-Step Guide:</b>
-
-1️⃣ Create bot with @BotFather
-2️⃣ Push your code to GitHub
-3️⃣ Send /deploy to this bot
-4️⃣ Provide token, name, and repo URL
-5️⃣ Done! Bot deployed automatically
-
-<b>🐍 Python Example (bot.py):</b>
-<code>import os
-from telegram.ext import Application, CommandHandler
-
-async def start(update, context):
-    await update.message.reply_text('Hi!')
-
-app = Application.builder().token(os.getenv('BOT_TOKEN')).build()
-app.add_handler(CommandHandler('start', start))
-app.run_polling()</code>
-
-<b>📦 Node.js Example (index.js):</b>
-<code>const { Telegraf } = require('telegraf');
-const bot = new Telegraf(process.env.BOT_TOKEN);
-bot.start((ctx) => ctx.reply('Hi!'));
-bot.launch();</code>
-
-<b>📋 Requirements:</b>
-• Public GitHub repo
-• requirements.txt (Python) or package.json (Node.js)
-• Use <code>process.env.BOT_TOKEN</code> or <code>os.getenv('BOT_TOKEN')</code>
-• Main file: bot.py, index.js, main.go, etc.
-
-<b>🐳 Advanced: Custom Docker</b>
-Include Dockerfile for custom setup!
-
-Need more help? Check examples:
-https://github.com/examples/telegram-bots
-        """
-        keyboard = [[InlineKeyboardButton("⬅️ Back", callback_data="my_bots")]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text(help_text, parse_mode='HTML', reply_markup=reply_markup)
-    
-    elif data == "stop_all":
-        user_bots = hosting.get_user_bots(user_id)
-        for bot_name in user_bots.keys():
-            hosting.stop_bot(user_id, bot_name)
-        await query.answer("✅ All bots stopped!", show_alert=True)
-        await show_bots_menu(update, context)
-    
-    elif data == "remove_all":
-        user_bots = hosting.get_user_bots(user_id)
-        for bot_name in list(user_bots.keys()):
-            hosting.remove_bot(user_id, bot_name)
-        await query.answer("✅ All bots removed!", show_alert=True)
-        await show_bots_menu(update, context)
-    
-    elif data == "add_new" or data == "deploy_new":
-        await start_deploy(update, context)
-    
-    elif data.startswith("bot_"):
-        bot_idx = int(data.split("_")[1]) - 1
-        user_bots = list(hosting.get_user_bots(user_id).keys())
-        if bot_idx < len(user_bots):
-            bot_name = user_bots[bot_idx]
-            await show_bot_control(update, context, bot_name)
-
-async def show_bot_control(update: Update, context: ContextTypes.DEFAULT_TYPE, bot_name: str):
-    """Show bot control panel"""
-    query = update.callback_query
-    user_id = update.effective_user.id
-    bot_info = hosting.get_user_bots(user_id)[bot_name]
-    
-    status_emoji = "🟢" if bot_info['status'] == 'running' else "🔴"
-    status_text = "RUNNING" if bot_info['status'] == 'running' else "STOPPED"
-    lang = bot_info.get('project_type', 'unknown').upper()
-    
-    message_text = f"<b>🤖 Bot: @{bot_name}</b>\n\n"
-    message_text += f"Status: {status_emoji} <b>{status_text}</b>\n"
-    message_text += f"Language: <b>{lang}</b>\n"
-    message_text += f"Repository: <code>{bot_info.get('repo_url', 'N/A')[:50]}</code>\n"
-    message_text += f"Added: {bot_info['added_at'][:10]}\n"
+    text = f"🤖 <b>{bot_name}</b>\n\n"
+    text += f"📦 Repo: <code>{info['repo_url']}</code>\n"
+    text += f"🔧 Type: <b>{info['type'].upper()}</b>\n"
+    text += f"📄 Main: <code>{info['main_file']}</code>\n"
+    text += f"Status: <b>{info['status'].upper()}</b>\n"
+    if info.get('pid'):
+        text += f"PID: <code>{info['pid']}</code>\n"
+    text += f"\n📍 Path: <code>{os.path.join(BOTS_DIR, bot_name)}</code>"
     
     keyboard = []
     
-    if bot_info['status'] == 'running':
-        keyboard.append([InlineKeyboardButton("⏹️ STOP BOT", callback_data=f"stop_{bot_name}")])
-        keyboard.append([InlineKeyboardButton("🔄 RESTART", callback_data=f"restart_{bot_name}")])
+    if info['status'] == 'running':
+        keyboard.append([
+            InlineKeyboardButton("⏹️ Stop", callback_data=f"stop_{bot_name}"),
+            InlineKeyboardButton("🔄 Restart", callback_data=f"restart_{bot_name}")
+        ])
     else:
-        keyboard.append([InlineKeyboardButton("▶️ START BOT", callback_data=f"start_{bot_name}")])
+        keyboard.append([InlineKeyboardButton("▶️ Start", callback_data=f"start_{bot_name}")])
     
-    keyboard.append([InlineKeyboardButton("🔃 UPDATE FROM GITHUB", callback_data=f"update_{bot_name}")])
-    keyboard.append([InlineKeyboardButton("📊 VIEW LOGS", callback_data=f"logs_{bot_name}")])
-    keyboard.append([InlineKeyboardButton("🗑️ REMOVE BOT", callback_data=f"remove_{bot_name}")])
-    keyboard.append([InlineKeyboardButton("⬅️ BACK", callback_data="back")])
+    keyboard.append([
+        InlineKeyboardButton("⬆️ Update", callback_data=f"update_{bot_name}"),
+        InlineKeyboardButton("📋 Logs", callback_data=f"logs_{bot_name}")
+    ])
+    keyboard.append([
+        InlineKeyboardButton("🗑️ Remove", callback_data=f"rm_{bot_name}"),
+        InlineKeyboardButton("🔙 Back", callback_data="refresh")
+    ])
     
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await query.edit_message_text(message_text, parse_mode='HTML', reply_markup=reply_markup)
+    await query.message.edit_text(text, parse_mode='HTML', reply_markup=reply_markup)
 
-async def handle_bot_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle bot actions"""
+async def execute_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Execute shell command on VPS"""
+    if not is_admin(update.effective_user.id):
+        return
+    
+    if not context.args:
+        await update.message.reply_text(
+            "<b>Execute Command on VPS</b>\n\n"
+            "<code>/cmd your_command</code>\n\n"
+            "<b>Examples:</b>\n"
+            "<code>/cmd ls -la</code>\n"
+            "<code>/cmd df -h</code>\n"
+            "<code>/cmd free -h</code>\n"
+            "<code>/cmd ps aux | grep python</code>\n\n"
+            "⚠️ Use with caution!",
+            parse_mode='HTML'
+        )
+        return
+    
+    command = ' '.join(context.args)
+    
+    msg = await update.message.reply_text(f"⚙️ Executing: <code>{command}</code>", parse_mode='HTML')
+    
+    success, output = vps_manager.execute_command(command)
+    
+    if len(output) > 4000:
+        output = output[:4000] + "\n... (output truncated)"
+    
+    result_text = f"<b>Command:</b> <code>{command}</code>\n\n"
+    result_text += f"<b>Output:</b>\n<code>{output}</code>"
+    
+    await msg.edit_text(result_text, parse_mode='HTML')
+
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle button callbacks"""
     query = update.callback_query
+    
+    if not is_admin(query.from_user.id):
+        await query.answer("⛔ Access denied", show_alert=True)
+        return
+    
     data = query.data
-    user_id = update.effective_user.id
     
-    if data == "back":
-        await show_bots_menu(update, context)
+    if data == "refresh":
+        await show_bots(update, context)
+        await query.answer("Refreshed!")
+    
+    elif data == "close":
+        await query.message.delete()
+        await query.answer()
+    
+    elif data == "stopall":
+        count = 0
+        for name in vps_manager.bots.keys():
+            if vps_manager.stop_bot(name)[0]:
+                count += 1
+        await query.answer(f"Stopped {count} bot(s)!", show_alert=True)
+        await show_bots(update, context)
+    
+    elif data == "rmall":
+        count = len(vps_manager.bots)
+        for name in list(vps_manager.bots.keys()):
+            vps_manager.remove_bot(name)
+        await query.answer(f"Removed {count} bot(s)!", show_alert=True)
+        await show_bots(update, context)
+    
+    elif data == "addnew":
+        await query.answer()
+        await query.message.reply_text("/deploy name repo_url bot_token")
+    
+    elif data == "vpsinfo":
+        await query.answer("Refreshing...")
+        await vps_info(update, context)
+    
+    elif data.startswith("sel_"):
+        await query.answer()
+        await show_bot_settings(query, data[4:])
+    
+    elif data.startswith("start_"):
+        name = data[6:]
+        await query.answer("Starting...", show_alert=False)
+        success, msg = vps_manager.start_bot(name)
+        await query.answer(msg, show_alert=True)
+        await show_bot_settings(query, name)
+    
+    elif data.startswith("stop_"):
+        name = data[5:]
+        await query.answer("Stopping...", show_alert=False)
+        success, msg = vps_manager.stop_bot(name)
+        await query.answer(msg, show_alert=True)
+        await show_bot_settings(query, name)
+    
+    elif data.startswith("restart_"):
+        name = data[8:]
+        await query.answer("Restarting...", show_alert=False)
+        success, msg = vps_manager.restart_bot(name)
+        await query.answer(msg, show_alert=True)
+        await show_bot_settings(query, name)
+    
+    elif data.startswith("update_"):
+        name = data[7:]
+        await query.answer("Updating from GitHub...", show_alert=False)
+        success, msg = vps_manager.update_bot(name)
+        await query.answer(msg, show_alert=True)
+        await show_bot_settings(query, name)
+    
+    elif data.startswith("logs_"):
+        name = data[5:]
+        await query.answer()
+        logs = vps_manager.get_logs(name)
+        if len(logs) > 4000:
+            logs = logs[-4000:]
+        await query.message.reply_text(
+            f"📋 <b>Logs: {name}</b>\n\n<code>{logs}</code>",
+            parse_mode='HTML'
+        )
+    
+    elif data.startswith("rm_"):
+        name = data[3:]
+        vps_manager.remove_bot(name)
+        await query.answer("Bot removed!", show_alert=True)
+        await show_bots(update, context)
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show help"""
+    if not is_admin(update.effective_user.id):
         return
-    
-    action, bot_name = data.split("_", 1)
-    
-    if action == "start":
-        await query.answer("⏳ Starting bot...")
-        success, msg = hosting.start_bot(user_id, bot_name)
-        await query.message.reply_text(f"{'✅' if success else '❌'} {msg}")
-    
-    elif action == "stop":
-        success, msg = hosting.stop_bot(user_id, bot_name)
-        await query.answer(f"{'✅' if success else '❌'} {msg}", show_alert=True)
-    
-    elif action == "restart":
-        await query.answer("⏳ Restarting...")
-        hosting.stop_bot(user_id, bot_name)
-        success, msg = hosting.start_bot(user_id, bot_name)
-        await query.message.reply_text(f"{'✅' if success else '❌'} {msg}")
-    
-    elif action == "update":
-        await query.answer("⏳ Updating from GitHub...")
-        success, msg = hosting.update_bot(user_id, bot_name)
-        await query.message.reply_text(f"{'✅' if success else '❌'} {msg}")
-    
-    elif action == "remove":
-        success, msg = hosting.remove_bot(user_id, bot_name)
-        await query.answer(f"{'✅' if success else '❌'} {msg}", show_alert=True)
-        await show_bots_menu(update, context)
-        return
-    
-    elif action == "logs":
-        await query.answer("📊 Fetching logs...")
-        logs = hosting.get_logs(user_id, bot_name)
-        await query.message.reply_text(f"📊 <b>Logs:</b>\n\n<code>{logs}</code>", parse_mode='HTML')
-    
-    await show_bot_control(update, context, bot_name)
-
-# Deploy conversation
-async def start_deploy(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.callback_query:
-        await update.callback_query.answer()
-        message = update.callback_query.message
-    else:
-        message = update.message
-    
-    deploy_text = """
-🚀 <b>Deploy Bot from GitHub</b>
-
-I'll deploy your bot using Docker containers!
-
-<b>Step 1:</b> Send your bot token from @BotFather
-
-Example: <code>1234567890:ABCdefGHIjklMNOpqrsTUVwxyz</code>
-
-Send /cancel to cancel.
-    """
-    await message.reply_text(deploy_text, parse_mode='HTML')
-    return WAITING_BOT_TOKEN
-
-async def receive_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    token = update.message.text.strip()
-    
-    if ':' not in token or len(token) < 20:
-        await update.message.reply_text("❌ Invalid token format.")
-        return WAITING_BOT_TOKEN
-    
-    context.user_data['deploy_token'] = token
     
     await update.message.reply_text(
-        "✅ Token received!\n\n"
-        "<b>Step 2:</b> Send bot username (without @)\n\n"
-        "Example: <code>myfilebot</code>",
+        "🤖 <b>Yagami VPS Manager - Help</b>\n\n"
+        "<b>Control your VPS remotely!</b>\n\n"
+        "<b>Commands:</b>\n"
+        "/start - Start & VPS status\n"
+        "/vps - Detailed VPS info\n"
+        "/deploy name repo token - Deploy bot\n"
+        "/bots - Manage all bots\n"
+        "/cmd command - Execute shell command\n"
+        "/help - This help\n\n"
+        "<b>Supported Bot Types:</b>\n"
+        "✅ Python\n"
+        "✅ Node.js\n"
+        "✅ Docker\n"
+        "✅ Golang\n"
+        "✅ Shell scripts\n\n"
+        "<b>Features:</b>\n"
+        "• Deploy from any GitHub repo\n"
+        "• Auto-detect bot type\n"
+        "• Auto-install dependencies\n"
+        "• Start/Stop/Restart bots\n"
+        "• Update from GitHub\n"
+        "• View logs\n"
+        "• Execute VPS commands\n"
+        "• Monitor VPS resources\n\n"
+        "<b>Admin Only Access 🔒</b>",
         parse_mode='HTML'
     )
-    return WAITING_BOT_NAME
 
-async def receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    bot_name = update.message.text.strip().replace('@', '').lower()
+def main():
+    """Start the VPS manager bot"""
+    # Create directories
+    os.makedirs(BOTS_DIR, exist_ok=True)
+    os.makedirs('logs', exist_ok=True)
     
-    if not bot_name.isalnum():
-        await update.message.reply_text("❌ Bot name should contain only letters and numbers.")
-        return WAITING_BOT_NAME
+    # Get bot token
+    token = os.getenv('BOT_TOKEN')
+    if not token:
+        print("❌ BOT_TOKEN not set!")
+        return
     
-    context.user_data['deploy_name'] = bot_name
+    # Check admin IDs
+    if not ADMIN_IDS:
+        print("⚠️  WARNING: No ADMIN_IDS set!")
+        print("   Anyone can control your VPS!")
+        print("   Set ADMIN_IDS in .env for security!")
+    else:
+        print(f"✅ Admin IDs: {ADMIN_IDS}")
     
-    repo_example = """
-✅ Bot name received!
-
-<b>Step 3:</b> Send your GitHub repository URL
-
-<b>Supported Languages:</b>
-🐍 Python | 📦 Node.js | 🐹 Go | 💎 Ruby | 🐘 PHP
-
-<b>Examples:</b>
-<code>https://github.com/username/telegram-bot</code>
-<code>https://github.com/username/bot-repo.git</code>
-
-<b>Requirements:</b>
-• Public repository
-• Use <code>BOT_TOKEN</code> environment variable
-• Include requirements.txt or package.json
-
-<b>Python Example:</b>
-Use <code>os.getenv('BOT_TOKEN')</code>
-
-<b>Node.js Example:</b>
-Use <code>process.env.BOT_TOKEN</code>
-
-Repository will be auto-detected and deployed!
-    """
-    await update.message.reply_text(repo_example, parse_mode='HTML')
-    return WAITING_GITHUB_REPO
-
-async def receive_github_repo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    repo_url = update.message.text.strip()
-    user_id = update.effective_user.id
+    # Create application
+    app = Application.builder().token(token).build()
     
-    # Validate GitHub URL
-    if not re.match(r'https?://github\.com/[\w-]+/[\w.-]+', repo_url):
-        await update.message.reply_text(
-            "❌ Invalid GitHub URL.\n\n"
-            "Example: <code>https://github.com/username/repo</code>",
+    # Add handlers
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("vps", vps_info))
+    app.add_handler(CommandHandler("deploy", deploy_command))
+    app.add_handler(CommandHandler("bots", show_bots))
+    app.add_handler(CommandHandler("cmd", execute_cmd))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CallbackQueryHandler(button_callback))
+    
+    # Print startup info
+    print("=" * 60)
+    print("🤖 Yagami VPS Manager")
+    print("=" * 60)
+    print("Control your VPS remotely through Telegram!")
+    print("")
+    print("✅ Python bots")
+    print("✅ Node.js bots")
+    print("✅ Docker containers")
+    print("✅ Golang bots")
+    print("✅ Shell scripts")
+    print("")
+    print(f"📁 Bots directory: {BOTS_DIR}")
+    print(f"💾 Config file: {CONFIG_FILE}")
+    print("=" * 60)
+    print("🚀 Bot Manager Started!")
+    print("=" * 60)
+    
+    # Start polling
+    app.run_polling()
+
+if __name__ == '__main__':
+    main())
+
+async def deploy_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Deploy a new bot from GitHub"""
+    if not await admin_only(update, context):
+        return
+    
+    await update.message.reply_text(
+        "📦 <b>Deploy Bot from GitHub</b>\n\n"
+        "Send me the deployment details in this format:\n\n"
+        "<code>/deploy bot_name github_url bot_token main_file</code>\n\n"
+        "<b>Example:</b>\n"
+        "<code>/deploy myfilebot https://github.com/user/repo 123456:ABC-DEF main.py</code>\n\n"
+        "<b>Parameters:</b>\n"
+        "• <b>bot_name</b>: Name for your bot (no spaces)\n"
+        "• <b>github_url</b>: GitHub repository URL\n"
+        "• <b>bot_token</b>: Bot token from @BotFather\n"
+        "• <b>main_file</b>: Main Python file (default: main.py)\n\n"
+        "Note: main_file is optional, defaults to main.py",
+        parse_mode='HTML'
+    )
+
+async def deploy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /deploy command with parameters"""
+    if not await admin_only(update, context):
+        return
+    
+    if len(context.args) < 3:
+        await deploy_bot(update, context)
+        return
+    
+    bot_name = context.args[0]
+    repo_url = context.args[1]
+    bot_token = context.args[2]
+    main_file = context.args[3] if len(context.args) > 3 else 'main.py'
+    
+    # Validate inputs
+    if ' ' in bot_name:
+        await update.message.reply_text("❌ Bot name cannot contain spaces")
+        return
+    
+    if not repo_url.startswith('http'):
+        await update.message.reply_text("❌ Invalid GitHub URL")
+        return
+    
+    msg = await update.message.reply_text(
+        f"🚀 <b>Deploying {bot_name}...</b>\n\n"
+        f"📦 Cloning repository...",
+        parse_mode='HTML'
+    )
+    
+    # Clone repository
+    success, message = bot_manager.clone_repository(repo_url, bot_name)
+    
+    if not success:
+        await msg.edit_text(
+            f"❌ <b>Deployment Failed</b>\n\n"
+            f"Error: {message}",
             parse_mode='HTML'
         )
-        return WAITING_GITHUB_REPO
+        return
     
-    token = context.user_data.get('deploy_token')
-    bot_name = context.user_data.get('deploy_name')
-    
-    status_msg = await update.message.reply_text(
-        "⏳ <b>Deploying your bot...</b>\n\n"
-        "🔄 Step 1: Cloning repository...",
+    await msg.edit_text(
+        f"🚀 <b>Deploying {bot_name}...</b>\n\n"
+        f"✅ Repository cloned\n"
+        f"📦 Installing requirements...",
         parse_mode='HTML'
     )
     
-    try:
-        # Deploy bot
-        success, message = hosting.add_bot(user_id, bot_name, token, repo_url)
+    # Install requirements
+    success, message = bot_manager.install_requirements(bot_name)
+    
+    if not success:
+        await msg.edit_text(
+            f"⚠️ <b>Partial Deployment</b>\n\n"
+            f"Repository cloned but requirements failed:\n{message}\n\n"
+            f"You may need to install them manually.",
+            parse_mode='HTML'
+        )
+    else:
+        await msg.edit_text(
+            f"🚀 <b>Deploying {bot_name}...</b>\n\n"
+            f"✅ Repository cloned\n"
+            f"✅ Requirements installed\n"
+            f"💾 Saving configuration...",
+            parse_mode='HTML'
+        )
+    
+    # Add bot to configuration
+    bot_manager.add_bot(bot_name, repo_url, bot_token, main_file)
+    bot_manager.bots[bot_name]['last_deployed'] = datetime.now().isoformat()
+    bot_manager.save_config()
+    
+    await msg.edit_text(
+        f"✅ <b>Deployment Successful!</b>\n\n"
+        f"Bot: <b>{bot_name}</b>\n"
+        f"Repository: <code>{repo_url}</code>\n"
+        f"Status: <b>Stopped</b>\n\n"
+        f"Use /bots to start the bot!",
+        parse_mode='HTML'
+    )
+
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle button callbacks"""
+    query = update.callback_query
+    
+    if not is_admin(query.from_user.id):
+        await query.answer("⛔ Access denied", show_alert=True)
+        return
+    
+    await query.answer()
+    data = query.data
+    
+    if data == "refresh":
+        await show_bots(update, context)
         
+    elif data == "close":
+        await query.message.delete()
+        
+    elif data == "stop_all":
+        count = 0
+        for bot_name in bot_manager.bots.keys():
+            success, _ = bot_manager.stop_bot(bot_name)
+            if success:
+                count += 1
+        await query.answer(f"Stopped {count} bot(s)!", show_alert=True)
+        await show_bots(update, context)
+        
+    elif data == "remove_all":
+        count = len(bot_manager.bots)
+        for bot_name in list(bot_manager.bots.keys()):
+            bot_manager.remove_bot(bot_name)
+        await query.answer(f"Removed {count} bot(s)!", show_alert=True)
+        await show_bots(update, context)
+        
+    elif data == "add_new":
+        await query.message.reply_text(
+            "To deploy a new bot:\n"
+            "/deploy bot_name github_url bot_token [main_file]"
+        )
+        
+    elif data.startswith("select_"):
+        bot_name = data.replace("select_", "")
+        await show_bot_settings(query, bot_name)
+    
+    elif data.startswith("start_"):
+        bot_name = data.replace("start_", "")
+        success, message = bot_manager.start_bot(bot_name)
+        await query.answer(message, show_alert=True)
+        await show_bot_settings(query, bot_name)
+    
+    elif data.startswith("stop_"):
+        bot_name = data.replace("stop_", "")
+        success, message = bot_manager.stop_bot(bot_name)
+        await query.answer(message, show_alert=True)
+        await show_bot_settings(query, bot_name)
+    
+    elif data.startswith("restart_"):
+        bot_name = data.replace("restart_", "")
+        success, message = bot_manager.restart_bot(bot_name)
+        await query.answer(message, show_alert=True)
+        await show_bot_settings(query, bot_name)
+    
+    elif data.startswith("update_"):
+        bot_name = data.replace("update_", "")
+        await query.answer("Updating bot...", show_alert=False)
+        success, message = bot_manager.update_bot(bot_name)
+        await query.answer(message, show_alert=True)
+        await show_bot_settings(query, bot_name)
+    
+    elif data.startswith("remove_"):
+        bot_name = data.replace("remove_", "")
+        success = bot_manager.remove_bot(bot_name)
         if success:
-            await status_msg.edit_text(
-                "🔄 Step 2: Building Docker image...\n"
-                "This may take a minute...",
-                parse_mode='HTML'
-            )
-            
-            success_text = f"""
-✅ <b>Bot Deployed Successfully!</b>
-
-🤖 Bot: @{bot_name}
-📦 Repository: <code>{repo_url[:50]}...</code>
-📍 Status: Ready to start
-{message}
-
-Your bot is now hosted in a Docker container!
-Click below to start it.
-            """
-            
-            keyboard = [
-                [InlineKeyboardButton("▶️ Start Bot Now", callback_data=f"start_{bot_name}")],
-                [InlineKeyboardButton("📋 View My Bots", callback_data="my_bots")]
-            ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            
-            await status_msg.edit_text(success_text, parse_mode='HTML', reply_markup=reply_markup)
+            await query.answer("Bot removed!", show_alert=True)
+            await show_bots(update, context)
         else:
-            await status_msg.edit_text(
-                f"❌ <b>Deployment Failed</b>\n\n"
-                f"Error: {message}\n\n"
-                f"<b>Common Issues:</b>\n"
-                f"• Check if repo is public\n"
-                f"• Ensure requirements.txt or package.json exists\n"
-                f"• Verify bot code is correct\n\n"
-                f"Try again with /deploy",
-                parse_mode='HTML'
-            )
-        
-        context.user_data.clear()
-        return ConversationHandler.END
-        
-    except Exception as e:
-        await status_msg.edit_text(
-            f"❌ <b>Error:</b>\n<code>{str(e)}</code>\n\nTry /deploy again",
+            await query.answer("Failed to remove bot", show_alert=True)
+    
+    elif data.startswith("logs_"):
+        bot_name = data.replace("logs_", "")
+        logs = bot_manager.get_bot_logs(bot_name)
+        await query.message.reply_text(
+            f"📋 <b>Logs for {bot_name}</b>\n\n"
+            f"<code>{logs}</code>",
             parse_mode='HTML'
         )
-        return ConversationHandler.END
 
-async def cancel_deploy(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
-    await update.message.reply_text("❌ Deployment cancelled.")
-    return ConversationHandler.END
-
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show VPS stats command"""
-    stats = hosting.get_system_stats()
-    user_bots = hosting.get_user_bots(update.effective_user.id)
+async def show_bot_settings(query, bot_name):
+    """Show settings for a specific bot"""
+    if bot_name not in bot_manager.bots:
+        await query.answer("Bot not found!", show_alert=True)
+        return
     
-    stats_text = f"""
-📊 <b>VPS Statistics</b>
-
-<b>System Resources:</b>
-💻 CPU: {stats['cpu']:.1f}%
-🧠 RAM: {stats['memory_used']:.2f}GB / {stats['memory_total']:.2f}GB ({stats['memory_percent']:.1f}%)
-💾 Disk: {stats['disk_used']:.1f}GB / {stats['disk_total']:.1f}GB ({stats['disk_percent']:.1f}%)
-
-<b>Your Bots:</b>
-🤖 Total: {len(user_bots)}
-🟢 Running: {sum(1 for b in user_bots.values() if b['status'] == 'running')}
-🔴 Stopped: {sum(1 for b in user_bots.values() if b['status'] == 'stopped')}
-
-<b>Docker Status:</b> {'✅ Active' if hosting.docker_client else '❌ Inactive'}
-    """
+    bot_info = bot_manager.bots[bot_name]
+    status = bot_info['status']
     
-    await update.message.reply_text(stats_text, parse_mode='HTML')
+    text = f"🤖 <b>Bot: {bot_name}</b>\n\n"
+    text += f"📦 Repository: <code>{bot_info['repo_url']}</code>\n"
+    text += f"📄 Main File: <code>{bot_info['main_file']}</code>\n"
+    text += f"Status: <b>{status.upper()}</b>\n"
+    
+    if bot_info.get('pid'):
+        text += f"PID: <code>{bot_info['pid']}</code>\n"
+    
+    text += f"\n📅 Added: {bot_info.get('added_at', 'Unknown')[:10]}\n"
+    
+    if bot_info.get('last_deployed'):
+        text += f"🔄 Last Deployed: {bot_info['last_deployed'][:10]}\n"
+    
+    keyboard = []
+    
+    if status == 'running':
+        keyboard.append([
+            InlineKeyboardButton("⏹️ Stop", callback_data=f"stop_{bot_name}"),
+            InlineKeyboardButton("🔄 Restart", callback_data=f"restart_{bot_name}")
+        ])
+    else:
+        keyboard.append([
+            InlineKeyboardButton("▶️ Start", callback_data=f"start_{bot_name}")
+        ])
+    
+    keyboard.append([
+        InlineKeyboardButton("⬆️ Update from GitHub", callback_data=f"update_{bot_name}"),
+        InlineKeyboardButton("📋 Logs", callback_data=f"logs_{bot_name}")
+    ])
+    
+    keyboard.append([
+        InlineKeyboardButton("🗑️ Remove", callback_data=f"remove_{bot_name}"),
+        InlineKeyboardButton("🔙 Back", callback_data="refresh")
+    ])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.message.edit_text(text, parse_mode='HTML', reply_markup=reply_markup)
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show help message"""
+    if not await admin_only(update, context):
+        return
+    
+    help_text = """
+🤖 <b>Yagami Bot Manager - Help</b>
+
+<b>Deploy bots from GitHub repositories</b>
+
+<b>Commands:</b>
+/start - Start the manager
+/deploy - Deploy a new bot from GitHub
+/bots - View and manage all bots
+/help - Show this help
+
+<b>How to Deploy:</b>
+1. Push your bot code to GitHub
+2. Use /deploy with repo URL
+3. Manager clones and sets up bot
+4. Start bot from /bots panel
+
+<b>Features:</b>
+• Clone from any GitHub repository
+• Auto-install requirements.txt
+• Start/Stop/Restart bots
+• Update bots from GitHub (git pull)
+• View bot logs
+• Remove bots completely
+
+<b>Example Deployment:</b>
+<code>/deploy mybot https://github.com/user/repo TOKEN123 main.py</code>
+
+<b>Admin Only Access ✅</b>
+"""
+    await update.message.reply_text(help_text, parse_mode='HTML')
 
 def main():
     """Start the bot"""
-    TOKEN = os.getenv('BOT_TOKEN')
-    if not TOKEN:
-        print("❌ Error: BOT_TOKEN not set in environment!")
+    # Create directories
+    os.makedirs(BOTS_DIR, exist_ok=True)
+    os.makedirs('logs', exist_ok=True)
+    
+    # Get bot token
+    token = os.getenv('BOT_TOKEN')
+    if not token:
+        print("❌ Error: BOT_TOKEN environment variable not set")
         return
     
-    # Check Docker
-    try:
-        docker_client = docker.from_env()
-        docker_client.ping()
-        print("✅ Docker is running")
-    except Exception as e:
-        print(f"❌ Docker not available: {e}")
-        print("Install Docker: curl -fsSL https://get.docker.com | sh")
-        return
+    # Check admin IDs
+    if not ADMIN_IDS:
+        print("⚠️  Warning: No ADMIN_IDS set. All users will have access!")
+        print("   Set ADMIN_IDS in .env file for security")
+    else:
+        print(f"✅ Admin IDs configured: {ADMIN_IDS}")
     
-    # Check Git
-    try:
-        subprocess.run(['git', '--version'], capture_output=True, check=True)
-        print("✅ Git is installed")
-    except:
-        print("❌ Git not installed! Run: apt install git")
-        return
+    # Create application
+    app = Application.builder().token(token).build()
     
-    application = Application.builder().token(TOKEN).build()
+    # Add handlers
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("bots", show_bots))
+    app.add_handler(CommandHandler("deploy", deploy_command))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CallbackQueryHandler(button_callback))
     
-    # Deploy conversation
-    deploy_conv = ConversationHandler(
-        entry_points=[
-            CommandHandler('deploy', start_deploy),
-            CallbackQueryHandler(start_deploy, pattern="^(add_new|deploy_new)$")
-        ],
-        states={
-            WAITING_BOT_TOKEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_token)],
-            WAITING_BOT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_name)],
-            WAITING_GITHUB_REPO: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_github_repo)]
-        },
-        fallbacks=[CommandHandler('cancel', cancel_deploy)]
-    )
-    
-    # Handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("bots", show_bots_menu))
-    application.add_handler(CommandHandler("stats", stats_command))
-    application.add_handler(deploy_conv)
-    application.add_handler(CallbackQueryHandler(button_handler, pattern="^(my_bots|refresh|close|vps_stats|help|stop_all|remove_all)$"))
-    application.add_handler(CallbackQueryHandler(button_handler, pattern="^bot_\d+$"))
-    application.add_handler(CallbackQueryHandler(handle_bot_action))
-    
-    print("🚀 Yato VPS Bot Hosting Service Started!")
-    print("📦 Docker: Enabled")
-    print("🌐 Multi-language support: Active")
-    print("👥 Ready to accept deployments...")
-    
-    application.run_polling()
+    # Start bot
+    print("=" * 60)
+    print("🤖 Yagami Bot Manager Started!")
+    print("=" * 60)
+    print("Deploy Telegram bots from GitHub repositories")
+    print("Admin-only access enabled")
+    print("=" * 60)
+    app.run_polling()
 
 if __name__ == '__main__':
     main()
