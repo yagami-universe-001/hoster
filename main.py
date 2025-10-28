@@ -591,7 +591,7 @@ def main():
     app.run_polling()
 
 if __name__ == '__main__':
-    main())
+    main()
 
 async def deploy_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Deploy a new bot from GitHub"""
