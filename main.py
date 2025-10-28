@@ -11,7 +11,7 @@ import subprocess
 import shutil
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
 # Configuration
 CONFIG_FILE = 'bots_config.json'
@@ -342,276 +342,51 @@ async def show_bots(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await message.reply_text(text, parse_mode='HTML', reply_markup=reply_markup)
 
 async def show_bot_settings(query, bot_name):
-    """Show individual bot settings"""
-    if bot_name not in vps_manager.bots:
+    """Show settings for a specific bot"""
+    if bot_name not in bot_manager.bots:
         await query.answer("Bot not found!", show_alert=True)
         return
     
-    info = vps_manager.bots[bot_name]
+    bot_info = bot_manager.bots[bot_name]
+    status = bot_info['status']
     
-    text = f"🤖 <b>{bot_name}</b>\n\n"
-    text += f"📦 Repo: <code>{info['repo_url']}</code>\n"
-    text += f"🔧 Type: <b>{info['type'].upper()}</b>\n"
-    text += f"📄 Main: <code>{info['main_file']}</code>\n"
-    text += f"Status: <b>{info['status'].upper()}</b>\n"
-    if info.get('pid'):
-        text += f"PID: <code>{info['pid']}</code>\n"
-    text += f"\n📍 Path: <code>{os.path.join(BOTS_DIR, bot_name)}</code>"
+    text = f"🤖 <b>Bot: {bot_name}</b>\n\n"
+    text += f"📦 Repository: <code>{bot_info['repo_url']}</code>\n"
+    text += f"📄 Main File: <code>{bot_info['main_file']}</code>\n"
+    text += f"Status: <b>{status.upper()}</b>\n"
+    
+    if bot_info.get('pid'):
+        text += f"PID: <code>{bot_info['pid']}</code>\n"
+    
+    text += f"\n📅 Added: {bot_info.get('added_at', 'Unknown')[:10]}\n"
+    
+    if bot_info.get('last_deployed'):
+        text += f"🔄 Last Deployed: {bot_info['last_deployed'][:10]}\n"
     
     keyboard = []
     
-    if info['status'] == 'running':
+    if status == 'running':
         keyboard.append([
             InlineKeyboardButton("⏹️ Stop", callback_data=f"stop_{bot_name}"),
             InlineKeyboardButton("🔄 Restart", callback_data=f"restart_{bot_name}")
         ])
     else:
-        keyboard.append([InlineKeyboardButton("▶️ Start", callback_data=f"start_{bot_name}")])
+        keyboard.append([
+            InlineKeyboardButton("▶️ Start", callback_data=f"start_{bot_name}")
+        ])
     
     keyboard.append([
-        InlineKeyboardButton("⬆️ Update", callback_data=f"update_{bot_name}"),
+        InlineKeyboardButton("⬆️ Update from GitHub", callback_data=f"update_{bot_name}"),
         InlineKeyboardButton("📋 Logs", callback_data=f"logs_{bot_name}")
     ])
+    
     keyboard.append([
-        InlineKeyboardButton("🗑️ Remove", callback_data=f"rm_{bot_name}"),
+        InlineKeyboardButton("🗑️ Remove", callback_data=f"remove_{bot_name}"),
         InlineKeyboardButton("🔙 Back", callback_data="refresh")
     ])
     
     reply_markup = InlineKeyboardMarkup(keyboard)
     await query.message.edit_text(text, parse_mode='HTML', reply_markup=reply_markup)
-
-async def execute_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Execute shell command on VPS"""
-    if not is_admin(update.effective_user.id):
-        return
-    
-    if not context.args:
-        await update.message.reply_text(
-            "<b>Execute Command on VPS</b>\n\n"
-            "<code>/cmd your_command</code>\n\n"
-            "<b>Examples:</b>\n"
-            "<code>/cmd ls -la</code>\n"
-            "<code>/cmd df -h</code>\n"
-            "<code>/cmd free -h</code>\n"
-            "<code>/cmd ps aux | grep python</code>\n\n"
-            "⚠️ Use with caution!",
-            parse_mode='HTML'
-        )
-        return
-    
-    command = ' '.join(context.args)
-    
-    msg = await update.message.reply_text(f"⚙️ Executing: <code>{command}</code>", parse_mode='HTML')
-    
-    success, output = vps_manager.execute_command(command)
-    
-    if len(output) > 4000:
-        output = output[:4000] + "\n... (output truncated)"
-    
-    result_text = f"<b>Command:</b> <code>{command}</code>\n\n"
-    result_text += f"<b>Output:</b>\n<code>{output}</code>"
-    
-    await msg.edit_text(result_text, parse_mode='HTML')
-
-async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle button callbacks"""
-    query = update.callback_query
-    
-    if not is_admin(query.from_user.id):
-        await query.answer("⛔ Access denied", show_alert=True)
-        return
-    
-    data = query.data
-    
-    if data == "refresh":
-        await show_bots(update, context)
-        await query.answer("Refreshed!")
-    
-    elif data == "close":
-        await query.message.delete()
-        await query.answer()
-    
-    elif data == "stopall":
-        count = 0
-        for name in vps_manager.bots.keys():
-            if vps_manager.stop_bot(name)[0]:
-                count += 1
-        await query.answer(f"Stopped {count} bot(s)!", show_alert=True)
-        await show_bots(update, context)
-    
-    elif data == "rmall":
-        count = len(vps_manager.bots)
-        for name in list(vps_manager.bots.keys()):
-            vps_manager.remove_bot(name)
-        await query.answer(f"Removed {count} bot(s)!", show_alert=True)
-        await show_bots(update, context)
-    
-    elif data == "addnew":
-        await query.answer()
-        await query.message.reply_text("/deploy name repo_url bot_token")
-    
-    elif data == "vpsinfo":
-        await query.answer("Refreshing...")
-        await vps_info_command(update, context)
-    
-    elif data.startswith("sel_"):
-        await query.answer()
-        await show_bot_settings(query, data[4:])
-    
-    elif data.startswith("start_"):
-        name = data[6:]
-        await query.answer("Starting...", show_alert=False)
-        success, msg = vps_manager.start_bot(name)
-        await query.answer(msg, show_alert=True)
-        await show_bot_settings(query, name)
-    
-    elif data.startswith("stop_"):
-        name = data[5:]
-        await query.answer("Stopping...", show_alert=False)
-        success, msg = vps_manager.stop_bot(name)
-        await query.answer(msg, show_alert=True)
-        await show_bot_settings(query, name)
-    
-    elif data.startswith("restart_"):
-        name = data[8:]
-        await query.answer("Restarting...", show_alert=False)
-        success, msg = vps_manager.restart_bot(name)
-        await query.answer(msg, show_alert=True)
-        await show_bot_settings(query, name)
-    
-    elif data.startswith("update_"):
-        name = data[7:]
-        await query.answer("Updating from GitHub...", show_alert=False)
-        success, msg = vps_manager.update_bot(name)
-        await query.answer(msg, show_alert=True)
-        await show_bot_settings(query, name)
-    
-    elif data.startswith("logs_"):
-        name = data[5:]
-        await query.answer()
-        logs = vps_manager.get_logs(name)
-        if len(logs) > 4000:
-            logs = logs[-4000:]
-        await query.message.reply_text(
-            f"📋 <b>Logs: {name}</b>\n\n<code>{logs}</code>",
-            parse_mode='HTML'
-        )
-    
-    elif data.startswith("rm_"):
-        name = data[3:]
-        vps_manager.remove_bot(name)
-        await query.answer("Bot removed!", show_alert=True)
-        await show_bots(update, context)
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show help"""
-    if not is_admin(update.effective_user.id):
-        return
-    
-    await update.message.reply_text(
-        "🤖 <b>Yagami VPS Manager - Help</b>\n\n"
-        "<b>Control your VPS remotely!</b>\n\n"
-        "<b>Commands:</b>\n"
-        "/start - Start & VPS status\n"
-        "/vps - Detailed VPS info\n"
-        "/deploy name repo token - Deploy bot\n"
-        "/bots - Manage all bots\n"
-        "/cmd command - Execute shell command\n"
-        "/help - This help\n\n"
-        "<b>Supported Bot Types:</b>\n"
-        "✅ Python\n"
-        "✅ Node.js\n"
-        "✅ Docker\n"
-        "✅ Golang\n"
-        "✅ Shell scripts\n\n"
-        "<b>Features:</b>\n"
-        "• Deploy from any GitHub repo\n"
-        "• Auto-detect bot type\n"
-        "• Auto-install dependencies\n"
-        "• Start/Stop/Restart bots\n"
-        "• Update from GitHub\n"
-        "• View logs\n"
-        "• Execute VPS commands\n"
-        "• Monitor VPS resources\n\n"
-        "<b>Admin Only Access 🔒</b>",
-        parse_mode='HTML'
-    )
-
-def main():
-    """Start the VPS manager bot"""
-    # Create directories
-    os.makedirs(BOTS_DIR, exist_ok=True)
-    os.makedirs('logs', exist_ok=True)
-    
-    # Get bot token
-    token = os.getenv('BOT_TOKEN')
-    if not token:
-        print("❌ BOT_TOKEN not set!")
-        return
-    
-    # Check admin IDs
-    if not ADMIN_IDS:
-        print("⚠️  WARNING: No ADMIN_IDS set!")
-        print("   Anyone can control your VPS!")
-        print("   Set ADMIN_IDS in .env for security!")
-    else:
-        print(f"✅ Admin IDs: {ADMIN_IDS}")
-    
-    # Create application
-    app = Application.builder().token(token).build()
-    
-    # Add handlers
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("vps", vps_info_command))
-    app.add_handler(CommandHandler("deploy", deploy_command))
-    app.add_handler(CommandHandler("bots", show_bots))
-    app.add_handler(CommandHandler("cmd", execute_cmd))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(CallbackQueryHandler(button_callback))
-    
-    # Print startup info
-    print("=" * 60)
-    print("🤖 Yagami VPS Manager")
-    print("=" * 60)
-    print("Control your VPS remotely through Telegram!")
-    print("")
-    print("✅ Python bots")
-    print("✅ Node.js bots")
-    print("✅ Docker containers")
-    print("✅ Golang bots")
-    print("✅ Shell scripts")
-    print("")
-    print(f"📁 Bots directory: {BOTS_DIR}")
-    print(f"💾 Config file: {CONFIG_FILE}")
-    print("=" * 60)
-    print("🚀 Bot Manager Started!")
-    print("=" * 60)
-    
-    # Start polling
-    app.run_polling()
-
-if __name__ == '__main__':
-    main()
-
-async def deploy_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Deploy a new bot from GitHub"""
-    if not await admin_only(update, context):
-        return
-    
-    await update.message.reply_text(
-        "📦 <b>Deploy Bot from GitHub</b>\n\n"
-        "Send me the deployment details in this format:\n\n"
-        "<code>/deploy bot_name github_url bot_token main_file</code>\n\n"
-        "<b>Example:</b>\n"
-        "<code>/deploy myfilebot https://github.com/user/repo 123456:ABC-DEF main.py</code>\n\n"
-        "<b>Parameters:</b>\n"
-        "• <b>bot_name</b>: Name for your bot (no spaces)\n"
-        "• <b>github_url</b>: GitHub repository URL\n"
-        "• <b>bot_token</b>: Bot token from @BotFather\n"
-        "• <b>main_file</b>: Main Python file (default: main.py)\n\n"
-        "Note: main_file is optional, defaults to main.py",
-        parse_mode='HTML'
-    )
 
 async def deploy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /deploy command with parameters"""
@@ -619,7 +394,20 @@ async def deploy_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     if len(context.args) < 3:
-        await deploy_bot(update, context)
+        await update.message.reply_text(
+            "📦 <b>Deploy Bot from GitHub</b>\n\n"
+            "Send me the deployment details in this format:\n\n"
+            "<code>/deploy bot_name github_url bot_token main_file</code>\n\n"
+            "<b>Example:</b>\n"
+            "<code>/deploy myfilebot https://github.com/user/repo 123456:ABC-DEF main.py</code>\n\n"
+            "<b>Parameters:</b>\n"
+            "• <b>bot_name</b>: Name for your bot (no spaces)\n"
+            "• <b>github_url</b>: GitHub repository URL\n"
+            "• <b>bot_token</b>: Bot token from @BotFather\n"
+            "• <b>main_file</b>: Main Python file (default: main.py)\n\n"
+            "Note: main_file is optional, defaults to main.py",
+            parse_mode='HTML'
+        )
         return
     
     bot_name = context.args[0]
@@ -701,15 +489,16 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("⛔ Access denied", show_alert=True)
         return
     
-    await query.answer()
     data = query.data
     
     if data == "refresh":
         await show_bots(update, context)
-        
+        await query.answer("Refreshed!")
+    
     elif data == "close":
         await query.message.delete()
-        
+        await query.answer()
+    
     elif data == "stop_all":
         count = 0
         for bot_name in bot_manager.bots.keys():
@@ -727,6 +516,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_bots(update, context)
         
     elif data == "add_new":
+        await query.answer()
         await query.message.reply_text(
             "To deploy a new bot:\n"
             "/deploy bot_name github_url bot_token [main_file]"
@@ -734,29 +524,33 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     elif data.startswith("select_"):
         bot_name = data.replace("select_", "")
+        await query.answer()
         await show_bot_settings(query, bot_name)
     
     elif data.startswith("start_"):
         bot_name = data.replace("start_", "")
+        await query.answer("Starting...", show_alert=False)
         success, message = bot_manager.start_bot(bot_name)
         await query.answer(message, show_alert=True)
         await show_bot_settings(query, bot_name)
     
     elif data.startswith("stop_"):
         bot_name = data.replace("stop_", "")
+        await query.answer("Stopping...", show_alert=False)
         success, message = bot_manager.stop_bot(bot_name)
         await query.answer(message, show_alert=True)
         await show_bot_settings(query, bot_name)
     
     elif data.startswith("restart_"):
         bot_name = data.replace("restart_", "")
+        await query.answer("Restarting...", show_alert=False)
         success, message = bot_manager.restart_bot(bot_name)
         await query.answer(message, show_alert=True)
         await show_bot_settings(query, bot_name)
     
     elif data.startswith("update_"):
         bot_name = data.replace("update_", "")
-        await query.answer("Updating bot...", show_alert=False)
+        await query.answer("Updating from GitHub...", show_alert=False)
         success, message = bot_manager.update_bot(bot_name)
         await query.answer(message, show_alert=True)
         await show_bot_settings(query, bot_name)
@@ -772,59 +566,15 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     elif data.startswith("logs_"):
         bot_name = data.replace("logs_", "")
+        await query.answer()
         logs = bot_manager.get_bot_logs(bot_name)
+        if len(logs) > 4000:
+            logs = logs[-4000:]
         await query.message.reply_text(
             f"📋 <b>Logs for {bot_name}</b>\n\n"
             f"<code>{logs}</code>",
             parse_mode='HTML'
         )
-
-async def show_bot_settings(query, bot_name):
-    """Show settings for a specific bot"""
-    if bot_name not in bot_manager.bots:
-        await query.answer("Bot not found!", show_alert=True)
-        return
-    
-    bot_info = bot_manager.bots[bot_name]
-    status = bot_info['status']
-    
-    text = f"🤖 <b>Bot: {bot_name}</b>\n\n"
-    text += f"📦 Repository: <code>{bot_info['repo_url']}</code>\n"
-    text += f"📄 Main File: <code>{bot_info['main_file']}</code>\n"
-    text += f"Status: <b>{status.upper()}</b>\n"
-    
-    if bot_info.get('pid'):
-        text += f"PID: <code>{bot_info['pid']}</code>\n"
-    
-    text += f"\n📅 Added: {bot_info.get('added_at', 'Unknown')[:10]}\n"
-    
-    if bot_info.get('last_deployed'):
-        text += f"🔄 Last Deployed: {bot_info['last_deployed'][:10]}\n"
-    
-    keyboard = []
-    
-    if status == 'running':
-        keyboard.append([
-            InlineKeyboardButton("⏹️ Stop", callback_data=f"stop_{bot_name}"),
-            InlineKeyboardButton("🔄 Restart", callback_data=f"restart_{bot_name}")
-        ])
-    else:
-        keyboard.append([
-            InlineKeyboardButton("▶️ Start", callback_data=f"start_{bot_name}")
-        ])
-    
-    keyboard.append([
-        InlineKeyboardButton("⬆️ Update from GitHub", callback_data=f"update_{bot_name}"),
-        InlineKeyboardButton("📋 Logs", callback_data=f"logs_{bot_name}")
-    ])
-    
-    keyboard.append([
-        InlineKeyboardButton("🗑️ Remove", callback_data=f"remove_{bot_name}"),
-        InlineKeyboardButton("🔙 Back", callback_data="refresh")
-    ])
-    
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await query.message.edit_text(text, parse_mode='HTML', reply_markup=reply_markup)
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Show help message"""
